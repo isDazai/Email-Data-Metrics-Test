@@ -273,12 +273,15 @@ function decodeByEncoding(body, encoding) {
   return body;
 }
 
-// Best-effort registrable-domain extraction (last two labels). Doesn't account for
-// multi-part public suffixes like .co.uk, but covers the vast majority of cases.
-function baseDomain(d) {
+// The "core" site name: strip a leading www. and drop everything from the first
+// remaining dot onward (i.e. the TLD). This lets us recognize "gulfinfotech",
+// "www.gulfinfotech", and "gulfinfotech.com" as the same site even when a TLD is
+// missing, truncated, or the display text is otherwise malformed - which is far
+// more common (broken signature software, email clients mangling text) than it
+// is a sign of phishing.
+function domainCoreName(d) {
   if (!d) return d;
-  const parts = d.split('.');
-  return parts.length <= 2 ? d : parts.slice(-2).join('.');
+  return d.replace(/^www\./i, '').split('.')[0].toLowerCase();
 }
 
 const SHORTENERS = ['bit.ly', 'tinyurl.com', 't.co', 'goo.gl', 'ow.ly', 'is.gd', 'buff.ly', 'rebrand.ly', 'cutt.ly'];
@@ -309,9 +312,9 @@ function analyzeLinks(rawSource, fromDomain) {
     const textDomainMatch = text.match(/((?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,})/);
     if (textDomainMatch) {
       const textDomain = textDomainMatch[1].toLowerCase();
-      // Compare registrable base domains (last two labels) so "www.x.com" vs "x.com"
-      // or "mail.x.com" vs "x.com" are correctly treated as the same site.
-      if (baseDomain(textDomain) !== baseDomain(hrefDomain)) {
+      // Compare core site names (www./TLD stripped) so "gulfinfotech" vs
+      // "gulfinfotech.com" vs "www.gulfinfotech" are all treated as the same site.
+      if (domainCoreName(textDomain) !== domainCoreName(hrefDomain)) {
         flags.push({
           check: 'Link text/destination mismatch',
           severity: 'danger',

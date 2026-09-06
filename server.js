@@ -926,24 +926,29 @@ async function callAiProvider(packet) {
   }
 }
 
-async function adjudicate(ctx, signals) {
+async function adjudicate(ctx, signals, force) {
   const ambiguous = signals.filter(s => s.aiEligible && !s.hard);
   const hard = signals.filter(s => s.hard);
 
-  // Cost control: nothing ambiguous to judge => no AI call at all.
-  if (!aiUsable() || !ambiguous.length) return { used: false, reason: !aiUsable() ? 'disabled' : 'no-ambiguous-signals', verdict: null };
+  if (!aiUsable()) return { used: false, available: false, reason: 'not-configured', verdict: null };
+  // AI is on-demand: the user presses "Ask AI to review" in the add-on.
+  if (!force) return { used: false, available: true, reason: 'not-requested', verdict: null };
 
-  const packet = buildSignalPacket(Object.assign({}, ctx, { hardSignals: hard }), ambiguous);
+  // When explicitly requested we run even with nothing ambiguous, so the button
+  // always returns an answer rather than silently doing nothing.
+  const packet = buildSignalPacket(Object.assign({}, ctx, { hardSignals: hard }), ambiguous.length ? ambiguous : signals);
   const key = 'ai:' + crypto.createHash('sha256').update(JSON.stringify(packet)).digest('hex');
   const cached = cacheGet(key, AI_CACHE_TTL_MS);
-  if (cached !== undefined) return { used: true, cached: true, verdict: cached };
+  if (cached !== undefined) return { used: true, available: true, cached: true, verdict: cached };
 
-  if (!aiRateLimitOk()) return { used: false, reason: 'rate-limited', verdict: null };
+  if (!aiRateLimitOk()) return { used: false, available: true, reason: 'rate-limited', verdict: null };
 
   const verdict = await callAiProvider(packet);
-  if (!verdict || typeof verdict !== 'object' || !verdict.verdict) return { used: false, reason: 'ai-error', verdict: null };
+  if (!verdict || typeof verdict !== 'object' || !verdict.verdict) {
+    return { used: false, available: true, reason: 'ai-error', verdict: null };
+  }
   cacheSet(key, verdict);
-  return { used: true, cached: false, verdict };
+  return { used: true, available: true, cached: false, verdict };
 }
 
 /**
@@ -991,7 +996,7 @@ app.post('/api/analyze', async (req, res) => {
   try {
     const {
       from = '', to = '', cc = '', replyTo = '', subject = '',
-      rawHeaders = '', selectedDomain = null, userEmail = ''
+      rawHeaders = '', selectedDomain = null, userEmail = '', aiReview = false
     } = req.body || {};
 
     const fromEmail = extractEmail(from);
@@ -1066,10 +1071,11 @@ app.post('/api/analyze', async (req, res) => {
 
     let signals = [...identity.signals, ...linkAnalysis.flags, ...repSignals, ...impSignals];
 
-    // --- AI adjudication ---------------------------------------------------
+    // --- AI adjudication (only when the user asked for it) ------------------
     const aiResult = await adjudicate(
       Object.assign({}, ctxBase, { suppressed, hardSignals: signals.filter(s => s.hard) }),
-      signals
+      signals,
+      aiReview === true || aiReview === 'true'
     );
     const applied = applyAiVerdict(signals, aiResult);
     signals = applied.signals;
@@ -1104,8 +1110,12 @@ app.post('/api/analyze', async (req, res) => {
       }
       : Object.assign({}, fallback, { source: 'rules' });
 
-    const visibleSignals = signals.filter(s => s.severity !== 'info');
-    const infoSignals = signals.filter(s => s.severity === 'info');
+    const decorated = signals.map(s => Object.assign({}, s, {
+      plain: plainFor(s.code).s || s.check,
+      plainAction: plainFor(s.code).a || null
+    }));
+    const visibleSignals = decorated.filter(s => s.severity !== 'info');
+    const infoSignals = decorated.filter(s => s.severity === 'info');
 
     res.json({
       // --- v2-compatible fields (so an older Code.gs keeps working) ---
@@ -1129,11 +1139,19 @@ app.post('/api/analyze', async (req, res) => {
       alignment: identity.context,
       riskScore: deterministicScore,
       ai: {
+        available: aiResult.available !== false,
         used: aiResult.used,
         cached: !!aiResult.cached,
         reason: aiResult.reason || null,
         provider: aiResult.used ? AI.provider : null,
         model: aiResult.used ? aiModel() : null,
+        verdict: aiResult.used && aiResult.verdict ? {
+          verdict: aiResult.verdict.verdict,
+          confidence: aiResult.verdict.confidence,
+          headline: aiResult.verdict.headline,
+          explanation: aiResult.verdict.explanation,
+          action: aiResult.verdict.action
+        } : null,
         adjustments: applied.notes
       }
     });

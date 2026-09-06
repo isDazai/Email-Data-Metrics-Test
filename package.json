@@ -1,7 +1,7 @@
 {
   "name": "email-data-metrics-api",
-  "version": "2.1.0",
-  "description": "Backend API for the Email Data Metrics add-on (Gmail + Outlook) - DNS, impersonation, header-spoofing, link, and domain-reputation checks.",
+  "version": "3.0.0",
+  "description": "Backend API for the Email Data Metrics add-on (Gmail + Outlook) - alignment-aware DNS, impersonation, header-spoofing, link and domain-reputation checks with optional AI adjudication of ambiguous signals.",
   "main": "server.js",
   "engines": {
     "node": ">=18"

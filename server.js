@@ -175,29 +175,49 @@ function headerSpoofingChecks({ fromRaw, fromEmail, fromDomain, replyTo, rawSour
     });
   }
 
-  // 2. Display name impersonating a brand not matching the domain
-  const displayName = extractDisplayName(fromRaw || '').toLowerCase();
-  if (displayName && fromDomain) {
+  // Detect Gmail/Google Groups' own "<Original Sender>" via <List/Org Name>" convention.
+  // This is Gmail *disclosing* a relay, not hiding one - if the domain actually matches
+  // the "via" part, brand-mismatch and reply-to checks below would be false positives.
+  const displayName = extractDisplayName(fromRaw || '');
+  const displayNameLower = displayName.toLowerCase();
+  const viaMatch = displayNameLower.match(/^["']?(.*?)["']?\s+via\s+(.+)$/);
+  let isTransparentRelay = false;
+  if (viaMatch && fromDomain) {
+    const viaPart = viaMatch[2].replace(/[^a-z0-9]/g, '');
+    const domainCore = domainCoreName(fromDomain).replace(/[^a-z0-9]/g, '');
+    if (viaPart && domainCore && (viaPart.indexOf(domainCore) > -1 || domainCore.indexOf(viaPart) > -1)) {
+      isTransparentRelay = true;
+    }
+  }
+
+  // 2. Display name impersonating a brand not matching the domain.
+  // NOTE: this is a soft/heuristic signal (a curated keyword list can never be complete,
+  // and legitimate resellers/partners can reference a brand name honestly) - it can
+  // corroborate other evidence but must never alone drive an overall "High" risk verdict.
+  if (!isTransparentRelay && displayNameLower && fromDomain) {
     for (const brand of BRAND_KEYWORDS) {
-      if (displayName.indexOf(brand) > -1 && fromDomain.indexOf(brand) === -1) {
+      if (displayNameLower.indexOf(brand) > -1 && fromDomain.indexOf(brand) === -1) {
         flags.push({
           check: 'Display name / domain mismatch',
-          severity: 'danger',
-          detail: `Sender display name references "${brand}" but the email domain is "${fromDomain}", which does not match. Classic brand-impersonation pattern.`
+          severity: 'warning',
+          detail: `Sender display name references "${brand}" but the email domain is "${fromDomain}", which does not match. Worth a second look, though this alone isn't conclusive.`
         });
         break;
       }
     }
   }
 
-  // 3. Reply-To silently pointing elsewhere
-  const replyDomains = getUniqueDomains(replyTo || '');
-  if (replyDomains.length && fromDomain && replyDomains.indexOf(fromDomain) === -1) {
-    flags.push({
-      check: 'Reply-To mismatch',
-      severity: 'warning',
-      detail: `Replies would go to "${replyDomains.join(', ')}", not the visible From domain "${fromDomain}". Common in business-email-compromise (BEC) attacks.`
-    });
+  // 3. Reply-To silently pointing elsewhere (skip for confirmed transparent relays,
+  // where the original message's own Reply-To is expected to differ)
+  if (!isTransparentRelay) {
+    const replyDomains = getUniqueDomains(replyTo || '');
+    if (replyDomains.length && fromDomain && replyDomains.indexOf(fromDomain) === -1) {
+      flags.push({
+        check: 'Reply-To mismatch',
+        severity: 'warning',
+        detail: `Replies would go to "${replyDomains.join(', ')}", not the visible From domain "${fromDomain}". Common in business-email-compromise (BEC) attacks.`
+      });
+    }
   }
 
   // 4. SPF/DKIM alignment awareness (useful especially when DMARC is missing/none)
@@ -325,6 +345,9 @@ function analyzeLinks(rawSource, fromDomain) {
 
     if (SHORTENERS.some(s => hrefDomain === s || hrefDomain.endsWith('.' + s))) {
       flags.push({ check: 'Shortened URL', severity: 'warning', detail: `Link uses a URL shortener (${hrefDomain}), which hides the real destination.` });
+    }
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hrefDomain) || /^\[[0-9a-f:]+\]$/i.test(hrefDomain)) {
+      flags.push({ check: 'Raw IP address link', severity: 'danger', detail: `Link points directly to an IP address (${hrefDomain}) instead of a domain name - unusual and objectively suspicious in a business email.` });
     }
     if (RISKY_TLDS.some(tld => hrefDomain.endsWith(tld))) {
       flags.push({ check: 'High-risk TLD', severity: 'warning', detail: `Link domain "${hrefDomain}" uses a TLD frequently abused for phishing.` });
@@ -460,18 +483,43 @@ app.post('/api/analyze', async (req, res) => {
     };
 
     const spoofingFlags = headerSpoofingChecks({ fromRaw: from, fromEmail, fromDomain, replyTo, rawSource: rawHeaders, authBlock });
+
+    // Explicit auth failure is the single most reliable signal available - it's the
+    // receiving mail server's own verdict, not a guess, so it's allowed to drive "High" alone.
+    if (auth.dmarc === 'Fail') {
+      spoofingFlags.push({
+        check: 'Authentication failed (DMARC)',
+        severity: 'danger',
+        detail: 'This message failed DMARC authentication at the receiving mail server - a strong, objective signal of spoofing or a serious misconfiguration.'
+      });
+    }
+    if (auth.spf === 'Fail' && auth.dkim === 'Fail') {
+      spoofingFlags.push({
+        check: 'Authentication failed (SPF + DKIM)',
+        severity: 'danger',
+        detail: 'Both SPF and DKIM failed for this message.'
+      });
+    }
+
     const linkAnalysis = analyzeLinks(rawHeaders, fromDomain);
     const reputationFlags = homoglyphChecks(activeDomain);
     const whoisInfo = activeDomain ? await whoisDomainAge(activeDomain) : { ageDays: null, risk: 'Unknown', creationDate: null };
     if (whoisInfo.risk === 'High' || whoisInfo.risk === 'Medium') {
       reputationFlags.push({
         check: 'Newly registered domain',
-        severity: whoisInfo.risk === 'High' ? 'danger' : 'warning',
-        detail: `Domain "${activeDomain}" was registered ~${whoisInfo.ageDays} day(s) ago. Freshly-registered domains are disproportionately used in phishing.`
+        severity: 'warning', // soft signal - new domains are common for legitimate new businesses too
+        detail: `Domain "${activeDomain}" was registered ~${whoisInfo.ageDays} day(s) ago. Freshly-registered domains are disproportionately used in phishing, but this alone doesn't confirm anything.`
       });
     }
 
-    const allFlags = [...spoofingFlags, ...linkAnalysis.flags, ...reputationFlags];
+    // Look-alike domains among addresses actually present in THIS message - deterministic,
+    // and never compared against an external brand list, so it can't false-positive on
+    // legitimate references to unrelated companies.
+    const impersonationFlags = imp.pairs.length
+      ? [{ check: 'Domain impersonation', severity: 'danger', detail: `Look-alike domains found among this message's own addresses: ${imp.pairs.join(', ')}.` }]
+      : [];
+
+    const allFlags = [...spoofingFlags, ...linkAnalysis.flags, ...reputationFlags, ...impersonationFlags];
     const overallRisk = computeOverallRisk(allFlags);
 
     res.json({

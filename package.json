@@ -1,13 +1,17 @@
 {
   "name": "email-data-metrics-api",
-  "version": "1.0.0",
-  "description": "Backend API for the Email Data Metrics add-on (Gmail + Outlook) - DNS, impersonation, and auth-header checks.",
+  "version": "2.1.0",
+  "description": "Backend API for the Email Data Metrics add-on (Gmail + Outlook) - DNS, impersonation, header-spoofing, link, and domain-reputation checks.",
   "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "cheerio": "^1.0.0"
   }
 }

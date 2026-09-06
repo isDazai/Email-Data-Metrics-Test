@@ -273,6 +273,14 @@ function decodeByEncoding(body, encoding) {
   return body;
 }
 
+// Best-effort registrable-domain extraction (last two labels). Doesn't account for
+// multi-part public suffixes like .co.uk, but covers the vast majority of cases.
+function baseDomain(d) {
+  if (!d) return d;
+  const parts = d.split('.');
+  return parts.length <= 2 ? d : parts.slice(-2).join('.');
+}
+
 const SHORTENERS = ['bit.ly', 'tinyurl.com', 't.co', 'goo.gl', 'ow.ly', 'is.gd', 'buff.ly', 'rebrand.ly', 'cutt.ly'];
 const RISKY_TLDS = ['.tk', '.top', '.xyz', '.click', '.gq', '.ml', '.cf', '.work', '.click', '.zip', '.review'];
 
@@ -296,11 +304,14 @@ function analyzeLinks(rawSource, fromDomain) {
     try { hrefDomain = new URL(href).hostname.toLowerCase(); } catch (e) { return; }
     seenDomains.add(hrefDomain);
 
-    // Anchor text displays a different domain than the actual destination
-    const textDomainMatch = text.match(/([a-zA-Z0-9-]+\.[a-zA-Z]{2,})/);
+    // Anchor text displays a different domain than the actual destination.
+    // Capture the FULL domain (all labels), not just the first word after a dot.
+    const textDomainMatch = text.match(/((?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,})/);
     if (textDomainMatch) {
       const textDomain = textDomainMatch[1].toLowerCase();
-      if (hrefDomain.indexOf(textDomain) === -1 && textDomain.indexOf(hrefDomain) === -1) {
+      // Compare registrable base domains (last two labels) so "www.x.com" vs "x.com"
+      // or "mail.x.com" vs "x.com" are correctly treated as the same site.
+      if (baseDomain(textDomain) !== baseDomain(hrefDomain)) {
         flags.push({
           check: 'Link text/destination mismatch',
           severity: 'danger',
@@ -320,7 +331,16 @@ function analyzeLinks(rawSource, fromDomain) {
     }
   });
 
-  return { flags, linkCount, domains: Array.from(seenDomains) };
+  // De-duplicate identical flags (e.g. the same link repeated in header + footer)
+  const seenFlagKeys = new Set();
+  const dedupedFlags = flags.filter(f => {
+    const k = f.check + '|' + f.detail;
+    if (seenFlagKeys.has(k)) return false;
+    seenFlagKeys.add(k);
+    return true;
+  });
+
+  return { flags: dedupedFlags, linkCount, domains: Array.from(seenDomains) };
 }
 
 /************ DOMAIN REPUTATION: homoglyph/punycode + WHOIS age ************/
